@@ -1,0 +1,211 @@
+# CI for skynight137/skills — modeled on the user-provided matrix example:
+# OS matrix, fail-fast: false, concurrency cancel-in-progress, artifacts
+# uploaded even on failure. Node is pinned to 26 (the fleet's major).
+#
+# Jobs:
+#   payload-checks  syntax + discovery + cited-path audit, 3 OSes.
+#   xdg-absent      setup.sh --help with every XDG var unset — the
+#                   "terkadang XDG tidak ada dan menyebabkan bugs" class.
+#   tomlkit-provision
+#                   fresh-box case: no tomlkit python and no uv on the
+#                   runner — setup must provision both itself so the
+#                   REPLIT_BASHRC pin lands (tests/tomlkit-provision.sh).
+#   tool-setups     per-tool install tests: each setup.sh lane installs
+#                   into an isolated root and must pass setup's own
+#                   --doctor line for that tool ("installed AND runs").
+#                   Ubuntu covers every lane; macOS covers the lanes
+#                   whose upstreams are cross-platform. Windows gets
+#                   no install legs — the lanes target unix layout and
+#                   binaries; its coverage is the payload checks.
+#                   Excluded: --join (needs a live tailnet auth key; its
+#                   install half is the tailscale leg), --zsh (Nix
+#                   profile lane, not a direct-binary install), and the
+#                   tailscale lane on macOS (upstream publishes no
+#                   user-local darwin build — the .pkg is system-wide).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  payload-checks:
+    name: Payloads (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false # one OS failing must not stop the others
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax (all payload scripts)
+        shell: bash
+        run: |
+          fail=0
+          while IFS= read -r f; do bash -n "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }; done \
+            < <(find scripts tests -name '*.sh' -type f)
+          exit $fail
+
+      - name: Python compile (cache outside the tree)
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: python3 -m py_compile scripts/*.py scripts/replit/*.py scripts/muse/*.py
+
+      - name: Skill discovery from a clean checkout
+        shell: bash
+        run: npx -y skills add ./ --list
+
+      - name: Path audit (every cited payload path exists)
+        shell: bash
+        run: |
+          fail=0
+          for p in $(grep -rhoE 'scripts/(muse|replit)/[A-Za-z0-9._/-]+' skills README.md \
+                     | sort -u); do
+            [ -e "$p" ] || { echo "CITED BUT MISSING: $p"; fail=1; }
+          done
+          exit $fail
+
+  xdg-absent:
+    name: XDG-absent smoke (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The bug class the user flagged: code that reads ambient XDG vars
+      # bare breaks or writes outside the tree when they are unset (some
+      # runners, some shells). The setup lanes under scripts/setup/
+      # are exempt by construction — setup.sh's preamble defines every
+      # XDG_* var before sourcing them — so this job checks the surfaces
+      # that face the raw environment:
+      # 1. Behavioral: replit setup --help with every XDG var unset must
+      #    still work (its preamble re-derives them itself).
+      - name: replit setup --help with XDG unset
+        # SETUP_ROOT stands in for the platform workspace a real box
+        # provides (REPL_HOME); without it setup cannot determine its
+        # install root and exits before the XDG derivation even runs —
+        # that is what the first CI run proved. The XDG vars stay unset:
+        # re-deriving them is the behaviour under test.
+        env:
+          SETUP_ROOT: ${{ runner.temp }}/ws
+        run: |
+          mkdir -p "$SETUP_ROOT"
+          env -u XDG_DATA_HOME -u XDG_STATE_HOME -u XDG_CONFIG_HOME \
+              -u XDG_CACHE_HOME -u XDG_BIN_HOME \
+            timeout 60 bash scripts/setup.sh --machine repl --help </dev/null >/dev/null
+
+      # 2. Python payloads must never hard-subscript an XDG var
+      #    (os.environ["XDG_..."] crashes when it is unset).
+      - name: No hard XDG subscripts in python payloads
+        run: |
+          if grep -rnE 'environ\\[.(XDG_[A-Z_]+)' scripts/ --include='*.py'; then
+            echo "hard XDG subscript found"; exit 1
+          fi
+          echo "python XDG reads all guarded"
+
+      # 3. Standalone shell entry points: no bare unguarded reads of the
+      #    ambient XDG homes.
+      - name: No unguarded XDG reads in standalone shell entry points
+        run: |
+          files="scripts/muse/setup.sh scripts/tour.sh scripts/replit/join-lifecycle-test.sh"
+          if grep -nE '\\$XDG_(DATA|STATE|CONFIG|CACHE)_HOME' $files \
+               | grep -vE ':[0-9]+:\\s*#' \
+               | grep -vE '\\$\\{XDG_[A-Z_]+:-' \
+               | grep -vE 'XDG_[A-Z_]+=' ; then
+            echo "Unguarded XDG reads found (see above)"; exit 1
+          fi
+          echo "standalone XDG reads guarded"
+
+  tomlkit-provision:
+    name: tomlkit provisioning (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner IS the fresh-box case: its python3 has no tomlkit and
+      # uv is not installed, so setup must provision both itself for the
+      # REPLIT_BASHRC pin to land. tests/tomlkit-provision.sh asserts on
+      # the pin + the doctor `toml python:` line + idempotency.
+      - name: setup provisions tomlkit; REPLIT_BASHRC pin lands
+        env:
+          SETUP_ROOT: ${{ runner.temp }}/ws-tomlkit
+        run: bash tests/tomlkit-provision.sh
+
+  tool-setups:
+    name: Tool setup (${{ matrix.tool }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false # one tool failing must not stop the others
+      matrix:
+        include:
+          # --- every lane, ubuntu ---
+          - {tool: uv, flag: --uv, label: "uv:", os: ubuntu-latest}
+          - {tool: node, flag: --node, label: "Node:", os: ubuntu-latest}
+          - {tool: opencode, flag: --opencode, label: "OpenCode:", os: ubuntu-latest}
+          - {tool: ollama, flag: --ollama, label: "Ollama:", os: ubuntu-latest}
+          - {tool: claude, flag: --claude, label: "Claude:", os: ubuntu-latest}
+          - {tool: hermes, flag: --hermes, label: "Hermes:", os: ubuntu-latest}
+          - {tool: ori, flag: --openrouterai, label: "ORI:", os: ubuntu-latest}
+          - {tool: rclone, flag: --rclone, label: "rclone:", os: ubuntu-latest}
+          - {tool: qbt, flag: --qbt, label: "qBittorrent-nox:", os: ubuntu-latest}
+          - {tool: aria2, flag: --aria2, label: "aria2c:", os: ubuntu-latest}
+          - {tool: ffmpeg, flag: --ffmpeg, label: "FFmpeg:", os: ubuntu-latest}
+          - {tool: cloudflared, flag: --cloudflared, label: "cloudflared:", os: ubuntu-latest}
+          - {tool: tailscale, flag: --tailscale, label: "tailscale:", os: ubuntu-latest}
+          - {tool: sshx, flag: --sshx, label: "sshx:", os: ubuntu-latest}
+          - {tool: lightpanda, flag: --lightpanda, label: "Lightpanda:", os: ubuntu-latest}
+          - {tool: llm-wiki, flag: --llm-wiki, label: "llm-wiki:", os: ubuntu-latest}
+          - {tool: camofox, flag: --camofox, label: "Camofox:", os: ubuntu-latest}
+          - {tool: moli, flag: --moli, label: "Moli:", os: ubuntu-latest}
+          - {tool: android, flag: --android-tools, label: "Android SDK (adb):", os: ubuntu-latest}
+          # --- cross-platform upstreams also run on macOS ---
+          - {tool: uv, flag: --uv, label: "uv:", os: macos-latest}
+          - {tool: node, flag: --node, label: "Node:", os: macos-latest}
+          - {tool: rclone, flag: --rclone, label: "rclone:", os: macos-latest}
+          - {tool: cloudflared, flag: --cloudflared, label: "cloudflared:", os: macos-latest}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The payloads need bash >= 4 (associative arrays); a stock Mac
+      # ships bash 3.2, so the macOS legs run under Homebrew's bash —
+      # the same remedy setup.sh's own version guard prescribes.
+      - name: Install modern bash (macOS legs)
+        if: matrix.os == 'macos-latest'
+        run: brew install bash
+
+      - name: Install ${{ matrix.tool }} into an isolated root and verify
+        env:
+          SETUP_ROOT: ${{ runner.temp }}/ws-${{ matrix.tool }}
+        run: bash tests/tool-setup.sh "${{ matrix.flag }}" "${{ matrix.label }}"
